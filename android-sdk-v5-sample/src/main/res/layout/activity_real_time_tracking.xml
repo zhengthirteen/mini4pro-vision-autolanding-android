@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <ImageView
+        android:id="@+id/main_view"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:scaleType="fitCenter"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <LinearLayout
+        android:id="@+id/status_panel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="20dp"
+        android:background="#80000000"
+        android:orientation="vertical"
+        android:padding="10dp"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <TextView
+            android:id="@+id/tv_height"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="目标占比: 0.00"
+            android:textColor="#00FF00"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tv_error_x"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="ErrX: 0.000"
+            android:textColor="#00FFFF"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/tv_error_y"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="ErrY: 0.000"
+            android:textColor="#00FFFF"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/tv_cmd"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Cmd R/P/V: 0.00 / 0.00 / 0.00"
+            android:textColor="#FFD54F"
+            android:textSize="15sp" />
+
+        <TextView
+            android:id="@+id/tv_vs_state"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="VS: OFF | Authority: -- | Reason: --"
+            android:textColor="#FFB74D"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/tv_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="状态: IDLE | 待机"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/right_panel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="20dp"
+        android:orientation="vertical"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <Button
+            android:id="@+id/btn_takeoff"
+            android:layout_width="120dp"
+            android:layout_height="wrap_content"
+            android:backgroundTint="#FF9800"
+            android:text="自动起飞"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btn_gimbal_down"
+            android:layout_width="120dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#607D8B"
+            android:text="云台朝下"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btn_enable_control"
+            android:layout_width="120dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#2196F3"
+            android:text="开启追踪"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btn_land"
+            android:layout_width="120dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#4CAF50"
+            android:text="自动降落"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <Button
+        android:id="@+id/btn_emergency_stop"
+        android:layout_width="220dp"
+        android:layout_height="60dp"
+        android:layout_marginBottom="30dp"
+        android:backgroundTint="#F44336"
+        android:text="紧急停止 / 释放控制"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>
