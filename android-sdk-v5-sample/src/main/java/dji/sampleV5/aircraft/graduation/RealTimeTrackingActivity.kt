@@ -47,6 +47,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         SEARCHING,
         ALIGNING,
         DESCENDING,
+        AUTO_LANDING,
         LOST,
         EMERGENCY_STOP
     }
@@ -57,11 +58,14 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         ROI
     }
 
-    // 预览与叠加层
+    private enum class RunMode {
+        PREVIEW,
+        CONTROL
+    }
+
     private lateinit var surfaceView: SurfaceView
     private lateinit var overlayView: DetectionOverlayView
 
-    // UI
     private lateinit var tvHeight: TextView
     private lateinit var tvErrorX: TextView
     private lateinit var tvErrorY: TextView
@@ -74,36 +78,33 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     private lateinit var btnLand: Button
     private lateinit var btnGimbal: Button
 
-    // Surface
     private var previewSurface: Surface? = null
     private var previewSurfaceWidth = 0
     private var previewSurfaceHeight = 0
 
-    // 状态
+    private var runMode = RunMode.PREVIEW
     private var isControlEnabled = false
     private var isGimbalDown = false
+    private var autoLandingActive = false
     private var trackingState = TrackingState.IDLE
+    private var lastStatusDetail = "待机"
 
     @Volatile
     private var isActivityAlive = true
 
-    // PID
     private val pidX = PIDController(maxSpeed = 0.5)
     private val pidY = PIDController(maxSpeed = 0.5)
 
-    // YOLO
     private lateinit var yoloDetector: YoloV8Detector
 
     @Volatile
     private var isYoloReady = false
 
-    // OpenCV：只给低频检测用，不再承担预览显示
     private var yuvMat: Mat? = null
     private var rgbMat: Mat? = null
     private var frameProc: Mat? = null
     private var globalDetectMat: Mat? = null
 
-    // 低频抽样检测缓冲
     private val frameLock = Any()
     private var sampledFrameBuffer: ByteArray? = null
     private var sampledFrameWidth = 0
@@ -113,20 +114,19 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     private val detectInFlight = AtomicBoolean(false)
     private var lastDetectRequestMs = 0L
 
-    // 检测 / 追踪
     private var lastTargetRect: Rect? = null
+    private var lastMainTarget: OverlayTarget? = null
     private var trackingLostCount = 0
     private var consecutiveFoundFrames = 0
     private var consecutiveAlignedFrames = 0
     private var consecutiveLostFrames = 0
+    private var consecutiveFinalFrames = 0
 
-    private var currentDisplayRect: Rect? = null
-    private var currentDisplayLabel: String? = null
-    private var currentDisplayConfidence: Float = 0f
+    private var currentDisplayTargets: List<OverlayTarget> = emptyList()
+    private var currentMainTarget: OverlayTarget? = null
     private var currentSearchMode = SearchMode.GLOBAL
     private var currentRoiRect: Rect? = null
 
-    // 控制显示
     private var lastCmdRoll = 0.0
     private var lastCmdPitch = 0.0
     private var lastCmdYaw = 0.0
@@ -135,45 +135,41 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     private var lastErrX = 0.0
     private var lastErrY = 0.0
 
-    // VS 状态
+    private var currentUltrasonicHeightM = 0.0
+    private var isAircraftFlying = false
+    private var landingConfirmationNeeded = false
+
     private var lastVsEnabled = false
     private var lastVsAuthority = "--"
     private var lastVsReason = "--"
 
-    // 仪表盘限频
     private var lastDashboardPushMs = 0L
 
-    // FPS / 检测频率
     private var previewFrameCount = 0
     private var detectFrameCount = 0
     private var previewFps = 0.0
     private var detectFps = 0.0
     private var fpsWindowStartMs = SystemClock.uptimeMillis()
 
-    private val controllableLabels = setOf(
-        "land_h",
-        "blue_circle_2",
-        "green_circle_3",
-        "red_circle_1"
-    )
-
     companion object {
         private const val TAG = "RealTimeTracking"
 
-        // 分辨率
         private const val PROC_W = 960
         private const val PROC_H = 540
         private const val CROP_SIZE = 480
-
-        // yolo采样检测频率
         private const val DETECT_INTERVAL_MS = 300L
 
         private const val LOST_FRAME_THRESHOLD = 10
         private const val FOUND_FRAME_THRESHOLD = 3
         private const val ALIGN_FRAME_THRESHOLD = 5
+        private const val FINAL_FRAME_THRESHOLD = 4
 
         private const val ALIGN_THRESHOLD_X = 0.08
         private const val ALIGN_THRESHOLD_Y = 0.08
+        private const val FINAL_ALIGN_THRESHOLD_X = 0.05
+        private const val FINAL_ALIGN_THRESHOLD_Y = 0.05
+        private const val FINAL_BOX_RATIO_THRESHOLD = 0.35
+        private const val FINAL_HEIGHT_THRESHOLD_M = 1.20
 
         private const val DASHBOARD_PUSH_INTERVAL_MS = 120L
     }
@@ -226,7 +222,6 @@ class RealTimeTrackingActivity : AppCompatActivity() {
             if (!isActivityAlive) return
             if (data.isEmpty() || width <= 0 || height <= 0) return
 
-            // 统计预览输入帧率
             tickPreviewFrame()
 
             if (!isYoloReady) return
@@ -267,6 +262,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         initView()
         setupListeners()
         initVirtualStickListener()
+        initTelemetryListeners()
 
         if (OpenCVLoader.initDebug()) {
             initYoloModel()
@@ -308,6 +304,76 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         )
         updateVsStateText()
         overlayView.clearOverlay()
+        updateControlUi()
+    }
+
+    private fun setupListeners() {
+        btnTakeoff.setOnClickListener {
+            KeyManager.getInstance().performAction(
+                KeyTools.createKey(FlightControllerKey.KeyStartTakeoff),
+                null
+            )
+            showStatus("已发送自动起飞")
+        }
+
+        btnLand.setOnClickListener {
+            if (autoLandingActive) {
+                showToast("自动降落已经接管")
+                return@setOnClickListener
+            }
+            startAutoLandingTransfer("手动移交自动降落")
+        }
+
+        btnGimbal.setOnClickListener {
+            if (isGimbalDown) {
+                controlGimbal(0.0)
+                isGimbalDown = false
+                btnGimbal.text = "云台朝下"
+                showStatus("云台回正")
+            } else {
+                controlGimbal(-90.0)
+                isGimbalDown = true
+                btnGimbal.text = "云台回正"
+                showStatus("云台朝下")
+            }
+        }
+
+        btnEnable.setOnClickListener {
+            if (!isYoloReady) {
+                showToast("AI 模型还没准备好")
+                return@setOnClickListener
+            }
+
+            if (autoLandingActive) {
+                showToast("自动降落接管中，不能重新进入控制")
+                return@setOnClickListener
+            }
+
+            if (isControlEnabled) {
+                showToast("控制模式已经在运行")
+                return@setOnClickListener
+            }
+
+            prepareForControlEntry()
+
+            if (!isGimbalDown) {
+                showToast("正在调整云台...")
+                controlGimbal(-90.0)
+                isGimbalDown = true
+                btnGimbal.text = "云台回正"
+                surfaceView.postDelayed({ startVirtualStick() }, 1200)
+            } else {
+                startVirtualStick()
+            }
+        }
+
+        btnStop.setOnClickListener {
+            if (autoLandingActive) {
+                stopAutoLandingAndEnterPreview("已停止自动降落")
+            } else {
+                stopTracking("紧急停止", TrackingState.EMERGENCY_STOP)
+            }
+        }
     }
 
     private fun initVirtualStickListener() {
@@ -315,6 +381,25 @@ class RealTimeTrackingActivity : AppCompatActivity() {
             VirtualStickManager.getInstance().setVirtualStickStateListener(vsStateListener)
         } catch (e: Exception) {
             Log.w(TAG, "setVirtualStickStateListener failed: ${e.message}")
+        }
+    }
+
+    private fun initTelemetryListeners() {
+        val keyManager = KeyManager.getInstance()
+        keyManager.listen(KeyTools.createKey(FlightControllerKey.KeyUltrasonicHeight), this, true) { _, newValue: Int? ->
+            currentUltrasonicHeightM = ((newValue ?: 0).toDouble() / 10.0).coerceAtLeast(0.0)
+        }
+        keyManager.listen(KeyTools.createKey(FlightControllerKey.KeyIsLandingConfirmationNeeded), this, true) { _, newValue: Boolean? ->
+            landingConfirmationNeeded = newValue == true
+            if (autoLandingActive && landingConfirmationNeeded) {
+                confirmLandingIfNeeded()
+            }
+        }
+        keyManager.listen(KeyTools.createKey(FlightControllerKey.KeyIsFlying), this, true) { _, newValue: Boolean? ->
+            isAircraftFlying = newValue == true
+            if (autoLandingActive && !isAircraftFlying) {
+                handleAutoLandingCompleted()
+            }
         }
     }
 
@@ -385,65 +470,26 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupListeners() {
-        btnTakeoff.setOnClickListener {
-            KeyManager.getInstance().performAction(
-                KeyTools.createKey(FlightControllerKey.KeyStartTakeoff),
-                null
-            )
-            showStatus("已发送自动起飞")
-        }
+    private fun prepareForControlEntry() {
+        pidX.reset()
+        pidY.reset()
+        autoLandingActive = false
+        landingConfirmationNeeded = false
+        runMode = RunMode.PREVIEW
 
-        btnLand.setOnClickListener {
-            stopTracking("移交自动降落", TrackingState.IDLE)
-            KeyManager.getInstance().performAction(
-                KeyTools.createKey(FlightControllerKey.KeyStartAutoLanding),
-                null
-            )
-            showStatus("已发送自动降落")
-        }
+        consecutiveFoundFrames = 0
+        consecutiveAlignedFrames = 0
+        consecutiveLostFrames = 0
+        consecutiveFinalFrames = 0
 
-        btnGimbal.setOnClickListener {
-            if (isGimbalDown) {
-                controlGimbal(0.0)
-                isGimbalDown = false
-                btnGimbal.text = "云台朝下"
-                showStatus("云台回正")
-            } else {
-                controlGimbal(-90.0)
-                isGimbalDown = true
-                btnGimbal.text = "云台回正"
-                showStatus("云台朝下")
-            }
-        }
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdYaw = 0.0
+        lastCmdVert = 0.0
+        lastStatusDetail = "准备进入控制模式"
 
-        btnEnable.setOnClickListener {
-            if (!isYoloReady) {
-                showToast("AI 模型还没准备好")
-                return@setOnClickListener
-            }
-
-            if (isControlEnabled) {
-                showToast("追踪已经在运行")
-                return@setOnClickListener
-            }
-
-            resetTrackingSession()
-
-            if (!isGimbalDown) {
-                showToast("正在调整云台...")
-                controlGimbal(-90.0)
-                isGimbalDown = true
-                btnGimbal.text = "云台回正"
-                surfaceView.postDelayed({ startVirtualStick() }, 1200)
-            } else {
-                startVirtualStick()
-            }
-        }
-
-        btnStop.setOnClickListener {
-            stopTracking("紧急停止", TrackingState.EMERGENCY_STOP)
-        }
+        updateDashboard(lastBoxRatio, lastErrX, lastErrY, 0.0, 0.0, 0.0, lastStatusDetail, force = true)
+        updateControlUi()
     }
 
     private fun startVirtualStick() {
@@ -456,20 +502,20 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         VirtualStickManager.getInstance().enableVirtualStick(object : CommonCallbacks.CompletionCallback {
             override fun onSuccess() {
                 isControlEnabled = true
+                autoLandingActive = false
+                runMode = RunMode.CONTROL
                 pidX.reset()
                 pidY.reset()
                 setTrackingState(TrackingState.SEARCHING, "已获取控制权，开始搜索目标")
-
-                runOnUiThread {
-                    if (!isActivityAlive) return@runOnUiThread
-                    btnEnable.text = "运行中..."
-                    btnEnable.isEnabled = false
-                }
+                updateControlUi()
             }
 
             override fun onFailure(error: IDJIError) {
                 isControlEnabled = false
+                autoLandingActive = false
+                runMode = RunMode.PREVIEW
                 setTrackingState(TrackingState.IDLE, "控制权获取失败: ${error.description()}")
+                updateControlUi()
             }
         })
     }
@@ -478,12 +524,15 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         sendVelocityCommand(0.0, 0.0, 0.0, 0.0)
 
         isControlEnabled = false
+        autoLandingActive = false
+        runMode = RunMode.PREVIEW
         pidX.reset()
         pidY.reset()
 
         consecutiveFoundFrames = 0
         consecutiveAlignedFrames = 0
         consecutiveLostFrames = 0
+        consecutiveFinalFrames = 0
 
         try {
             VirtualStickManager.getInstance().disableVirtualStick(null)
@@ -492,27 +541,107 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         }
 
         setTrackingState(nextState, reason)
+        updateControlUi()
+    }
 
-        runOnUiThread {
-            if (!isActivityAlive) return@runOnUiThread
-            btnEnable.text = "开启追踪"
-            btnEnable.isEnabled = true
+    private fun stopAutoLandingAndEnterPreview(reason: String) {
+        try {
+            KeyManager.getInstance().performAction(
+                KeyTools.createKey(FlightControllerKey.KeyStopAutoLanding),
+                null
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "stopAutoLanding failed: ${e.message}")
         }
+
+        autoLandingActive = false
+        runMode = RunMode.PREVIEW
+        setTrackingState(TrackingState.IDLE, reason)
+        updateControlUi()
+    }
+
+    private fun startAutoLandingTransfer(detail: String) {
+        sendVelocityCommand(0.0, 0.0, 0.0, 0.0)
+
+        if (isControlEnabled) {
+            try {
+                VirtualStickManager.getInstance().disableVirtualStick(null)
+            } catch (e: Exception) {
+                Log.w(TAG, "disableVirtualStick before autoland failed: ${e.message}")
+            }
+        }
+
+        isControlEnabled = false
+        autoLandingActive = true
+        runMode = RunMode.PREVIEW
+        pidX.reset()
+        pidY.reset()
+        consecutiveFoundFrames = 0
+        consecutiveAlignedFrames = 0
+        consecutiveLostFrames = 0
+        consecutiveFinalFrames = 0
+
+        setTrackingState(TrackingState.AUTO_LANDING, detail)
+        updateControlUi()
+
+        try {
+            KeyManager.getInstance().performAction(
+                KeyTools.createKey(FlightControllerKey.KeyStartAutoLanding),
+                null
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "startAutoLandingTransfer error: ${e.message}", e)
+            autoLandingActive = false
+            setTrackingState(TrackingState.IDLE, "自动降落下发失败: ${e.message}")
+            updateControlUi()
+        }
+    }
+
+    private fun confirmLandingIfNeeded() {
+        try {
+            KeyManager.getInstance().performAction(
+                KeyTools.createKey(FlightControllerKey.KeyConfirmLanding),
+                null
+            )
+            landingConfirmationNeeded = false
+            showStatus("低空确认已发送，继续自动降落")
+        } catch (e: Exception) {
+            Log.w(TAG, "confirmLandingIfNeeded failed: ${e.message}")
+        }
+    }
+
+    private fun handleAutoLandingCompleted() {
+        autoLandingActive = false
+        runMode = RunMode.PREVIEW
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdYaw = 0.0
+        lastCmdVert = 0.0
+        setTrackingState(TrackingState.IDLE, "自动降落完成")
+        updateControlUi()
+        updateDashboard(lastBoxRatio, lastErrX, lastErrY, 0.0, 0.0, 0.0, lastStatusDetail, force = true)
     }
 
     private fun resetTrackingSession() {
         pidX.reset()
         pidY.reset()
 
+        runMode = RunMode.PREVIEW
+        isControlEnabled = false
+        autoLandingActive = false
+        trackingState = TrackingState.IDLE
+        lastStatusDetail = "已重置会话"
+
         lastTargetRect = null
+        lastMainTarget = null
         trackingLostCount = 0
         consecutiveFoundFrames = 0
         consecutiveAlignedFrames = 0
         consecutiveLostFrames = 0
+        consecutiveFinalFrames = 0
 
-        currentDisplayRect = null
-        currentDisplayLabel = null
-        currentDisplayConfidence = 0f
+        currentDisplayTargets = emptyList()
+        currentMainTarget = null
         currentSearchMode = SearchMode.GLOBAL
         currentRoiRect = null
 
@@ -530,8 +659,8 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         detectFps = 0.0
         fpsWindowStartMs = SystemClock.uptimeMillis()
 
-        setTrackingState(TrackingState.IDLE, "已重置会话")
-        updateDashboard(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "待机", force = true)
+        updateDashboard(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, lastStatusDetail, force = true)
+        updateControlUi()
 
         runOnUiThread {
             if (!isActivityAlive) return@runOnUiThread
@@ -606,7 +735,6 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         var roiForThisFrame: Rect? = null
         var searchModeForThisFrame = SearchMode.GLOBAL
 
-        // A. 动态 ROI 追踪
         if (lastTargetRect != null && trackingLostCount < LOST_FRAME_THRESHOLD) {
             val roiRect = buildCropRect(lastTargetRect!!, imgW, imgH)
             val roiMat = Mat(frame, roiRect)
@@ -625,7 +753,6 @@ class RealTimeTrackingActivity : AppCompatActivity() {
             }
         }
 
-        // B. 中心鹰眼
         if (results.isEmpty()) {
             val centerRect = Rect(
                 (imgW - CROP_SIZE) / 2,
@@ -647,7 +774,6 @@ class RealTimeTrackingActivity : AppCompatActivity() {
             }
         }
 
-        // C. 全图缩放搜索
         if (results.isEmpty()) {
             Imgproc.resize(frame, globalDetectMat!!, Size(CROP_SIZE.toDouble(), CROP_SIZE.toDouble()))
             results = yoloDetector.detect(globalDetectMat!!)
@@ -662,52 +788,93 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         currentRoiRect = roiForThisFrame
         currentSearchMode = searchModeForThisFrame
 
-        val target = results.firstOrNull { it.label in controllableLabels }
+        val allTargets = results.map { result ->
+            val displayRect = restoreRectToProc(result.rect, roiForThisFrame, imgW, imgH)
+            OverlayTarget(
+                label = result.label,
+                confidence = result.confidence,
+                rect = displayRect
+            )
+        }
 
-        if (target != null) {
-            val displayRect = restoreRectToProc(target.rect, roiForThisFrame, imgW, imgH)
-            currentDisplayRect = Rect(displayRect.x, displayRect.y, displayRect.width, displayRect.height)
-            currentDisplayLabel = target.label
-            currentDisplayConfidence = target.confidence
-            lastTargetRect = Rect(displayRect.x, displayRect.y, displayRect.width, displayRect.height)
+        val selected = MainTargetSelector.selectMainTarget(allTargets, lastMainTarget, imgW, imgH)
+        currentMainTarget = selected?.deepCopy(isMainTarget = true)
+        currentDisplayTargets = allTargets.map { target ->
+            target.deepCopy(isMainTarget = selected != null && isSameRect(target.rect, selected.rect) && target.label == selected.label)
+        }
 
-            handleTargetFound(displayRect, imgW, imgH)
+        if (selected != null) {
+            lastMainTarget = selected.deepCopy()
+            lastTargetRect = Rect(selected.rect.x, selected.rect.y, selected.rect.width, selected.rect.height)
+
+            if (runMode == RunMode.CONTROL) {
+                handleTargetFound(selected, imgW, imgH)
+            } else {
+                holdPreviewObservation(selected, imgW, imgH)
+            }
         } else {
-            handleTargetLost()
+            if (runMode == RunMode.CONTROL) {
+                handleTargetLost()
+            } else {
+                holdPreviewNoTarget()
+            }
         }
     }
 
-    private fun pushOverlayToUi() {
-        val rectCopy = currentDisplayRect?.let { Rect(it.x, it.y, it.width, it.height) }
-        val roiCopy = currentRoiRect?.let { Rect(it.x, it.y, it.width, it.height) }
-        val labelCopy = currentDisplayLabel
-        val confCopy = currentDisplayConfidence
-        val modeText = when (currentSearchMode) {
-            SearchMode.ROI -> "ROI TRACKING"
-            SearchMode.EAGLE_EYE -> "EAGLE EYE"
-            SearchMode.GLOBAL -> "GLOBAL SEARCH"
+    private fun holdPreviewObservation(target: OverlayTarget, imgW: Int, imgH: Int) {
+        lastBoxRatio = target.rect.width.toDouble() / imgW.toDouble()
+        lastErrX = (target.centerX - imgW / 2.0) / (imgW / 2.0)
+        lastErrY = (target.centerY - imgH / 2.0) / (imgH / 2.0)
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdYaw = 0.0
+        lastCmdVert = 0.0
+
+        if (!shouldKeepCurrentStateInPreview()) {
+            trackingState = TrackingState.IDLE
+            lastStatusDetail = "预览模式：仅检测显示"
         }
+
+        updateDashboard(lastBoxRatio, lastErrX, lastErrY, 0.0, 0.0, 0.0, lastStatusDetail)
+    }
+
+    private fun holdPreviewNoTarget() {
+        lastErrX = 0.0
+        lastErrY = 0.0
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdYaw = 0.0
+        lastCmdVert = 0.0
+
+        if (!shouldKeepCurrentStateInPreview()) {
+            trackingState = TrackingState.IDLE
+            lastStatusDetail = "预览模式：未发现目标"
+        }
+
+        updateDashboard(lastBoxRatio, 0.0, 0.0, 0.0, 0.0, 0.0, lastStatusDetail)
+    }
+
+    private fun pushOverlayToUi() {
+        val targetsCopy = currentDisplayTargets.map { it.deepCopy() }
+        val roiCopy = currentRoiRect?.let { Rect(it.x, it.y, it.width, it.height) }
+        val modeText = buildOverlayModeText()
 
         runOnUiThread {
             if (!isActivityAlive) return@runOnUiThread
             overlayView.updateOverlay(
                 procWidth = PROC_W,
                 procHeight = PROC_H,
-                targetRect = rectCopy,
+                targets = targetsCopy,
                 roiRect = roiCopy,
-                label = labelCopy,
-                confidence = confCopy,
                 modeText = modeText
             )
         }
     }
 
-    private fun handleTargetFound(rect: Rect, imgW: Int, imgH: Int) {
-        val centerX = rect.x + rect.width / 2.0
-        val centerY = rect.y + rect.height / 2.0
-
-        val normErrorX = (centerX - imgW / 2.0) / (imgW / 2.0)
-        val normErrorY = (centerY - imgH / 2.0) / (imgH / 2.0)
+    private fun handleTargetFound(target: OverlayTarget, imgW: Int, imgH: Int) {
+        val rect = target.rect
+        val normErrorX = (target.centerX - imgW / 2.0) / (imgW / 2.0)
+        val normErrorY = (target.centerY - imgH / 2.0) / (imgH / 2.0)
         val boxRatio = rect.width.toDouble() / imgW.toDouble()
 
         lastBoxRatio = boxRatio
@@ -722,6 +889,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         }
 
         val alignedNow = abs(normErrorX) < ALIGN_THRESHOLD_X && abs(normErrorY) < ALIGN_THRESHOLD_Y
+        val finalAlignedNow = abs(normErrorX) < FINAL_ALIGN_THRESHOLD_X && abs(normErrorY) < FINAL_ALIGN_THRESHOLD_Y
 
         if (trackingState == TrackingState.SEARCHING && consecutiveFoundFrames >= FOUND_FRAME_THRESHOLD) {
             setTrackingState(TrackingState.ALIGNING, "目标稳定，开始对准")
@@ -731,6 +899,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
             if (alignedNow) {
                 consecutiveAlignedFrames++
                 if (consecutiveAlignedFrames >= ALIGN_FRAME_THRESHOLD) {
+                    consecutiveFinalFrames = 0
                     setTrackingState(TrackingState.DESCENDING, "对准稳定，开始下降")
                 }
             } else {
@@ -739,16 +908,22 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         } else if (trackingState == TrackingState.DESCENDING) {
             if (!alignedNow) {
                 consecutiveAlignedFrames = 0
+                consecutiveFinalFrames = 0
                 setTrackingState(TrackingState.ALIGNING, "偏差变大，回到对准")
+            } else if (finalAlignedNow && isReadyForAutoLanding(boxRatio)) {
+                consecutiveFinalFrames++
+                if (consecutiveFinalFrames >= FINAL_FRAME_THRESHOLD) {
+                    startAutoLandingTransfer("进入最终阶段，移交自动降落")
+                    return
+                }
+            } else {
+                consecutiveFinalFrames = 0
             }
         }
 
         val vRoll = pidX.calculate(normErrorX * 2.0)
         val vPitch = pidY.calculate(-normErrorY * 2.0)
-        val vVert = when (trackingState) {
-            TrackingState.DESCENDING -> computeVerticalSpeed(boxRatio)
-            else -> 0.0
-        }
+        val vVert = if (trackingState == TrackingState.DESCENDING) computeVerticalSpeed(boxRatio) else 0.0
 
         when (trackingState) {
             TrackingState.SEARCHING -> {
@@ -763,9 +938,10 @@ class RealTimeTrackingActivity : AppCompatActivity() {
 
             TrackingState.DESCENDING -> {
                 sendVelocityCommand(vRoll, vPitch, 0.0, vVert)
-                updateDashboard(boxRatio, normErrorX, normErrorY, vRoll, vPitch, vVert, "对准后下降")
+                updateDashboard(boxRatio, normErrorX, normErrorY, vRoll, vPitch, vVert, "视觉下降中")
             }
 
+            TrackingState.AUTO_LANDING,
             TrackingState.LOST,
             TrackingState.EMERGENCY_STOP,
             TrackingState.IDLE -> {
@@ -778,36 +954,30 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     private fun handleTargetLost() {
         consecutiveFoundFrames = 0
         consecutiveAlignedFrames = 0
+        consecutiveFinalFrames = 0
         consecutiveLostFrames++
 
         if (consecutiveLostFrames > LOST_FRAME_THRESHOLD) {
             trackingLostCount = LOST_FRAME_THRESHOLD
             lastTargetRect = null
-            currentDisplayRect = null
-            currentDisplayLabel = null
-            currentDisplayConfidence = 0f
+            lastMainTarget = null
+            currentMainTarget = null
+            currentDisplayTargets = emptyList()
             currentRoiRect = null
             currentSearchMode = SearchMode.GLOBAL
 
             if (isControlEnabled) {
                 setTrackingState(TrackingState.LOST, "目标丢失")
             }
-
-            runOnUiThread {
-                if (!isActivityAlive) return@runOnUiThread
-                overlayView.clearOverlay()
-            }
-        } else {
-            if (isControlEnabled && trackingState != TrackingState.SEARCHING) {
-                setTrackingState(TrackingState.SEARCHING, "短时丢失，继续搜索")
-            }
+        } else if (isControlEnabled && trackingState != TrackingState.SEARCHING) {
+            setTrackingState(TrackingState.SEARCHING, "短时丢失，继续搜索")
         }
 
         if (isControlEnabled) {
             sendVelocityCommand(0.0, 0.0, 0.0, 0.0)
         }
 
-        updateDashboard(lastBoxRatio, 0.0, 0.0, 0.0, 0.0, 0.0, "Searching...")
+        updateDashboard(lastBoxRatio, 0.0, 0.0, 0.0, 0.0, 0.0, lastStatusDetail)
     }
 
     private fun buildCropRect(lastRect: Rect, imgW: Int, imgH: Int): Rect {
@@ -860,6 +1030,8 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         lastCmdYaw = yawSpeed
         lastCmdVert = verticalSpeed
 
+        if (!isControlEnabled) return
+
         val speedToStickGain = 660.0
         val rollStickVal = (rollSpeed * speedToStickGain).toInt()
         val pitchStickVal = (pitchSpeed * speedToStickGain).toInt()
@@ -893,6 +1065,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
 
     private fun setTrackingState(newState: TrackingState, detail: String) {
         trackingState = newState
+        lastStatusDetail = detail
         showStatus(detail)
     }
 
@@ -902,13 +1075,27 @@ class RealTimeTrackingActivity : AppCompatActivity() {
             TrackingState.SEARCHING -> "SEARCHING"
             TrackingState.ALIGNING -> "ALIGNING"
             TrackingState.DESCENDING -> "DESCENDING"
+            TrackingState.AUTO_LANDING -> "AUTO_LANDING"
             TrackingState.LOST -> "LOST"
-            TrackingState.EMERGENCY_STOP -> "EMERGENCY_STOP"
+            TrackingState.EMERGENCY_STOP -> "STOP"
         }
     }
 
+    private fun buildOverlayModeText(): String {
+        val searchText = when (currentSearchMode) {
+            SearchMode.ROI -> "ROI TRACKING"
+            SearchMode.EAGLE_EYE -> "EAGLE EYE"
+            SearchMode.GLOBAL -> "GLOBAL SEARCH"
+        }
+        val runText = when (runMode) {
+            RunMode.PREVIEW -> "PREVIEW"
+            RunMode.CONTROL -> "CONTROL"
+        }
+        return "$searchText | $runText"
+    }
+
     private fun buildStatusLine(detail: String): String {
-        return "状态: ${stateLabel(trackingState)} | $detail | FPS: %.1f | DET: %.1fHz"
+        return "状态: ${stateLabel(trackingState)} | 模式: ${runMode.name} | $detail | FPS: %.1f | DET: %.1fHz"
             .format(previewFps, detectFps)
     }
 
@@ -946,13 +1133,14 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         detail: String,
         force: Boolean = false
     ) {
+        lastStatusDetail = detail
         val now = SystemClock.uptimeMillis()
         if (!force && now - lastDashboardPushMs < DASHBOARD_PUSH_INTERVAL_MS) return
         lastDashboardPushMs = now
 
         runOnUiThread {
             if (!isActivityAlive) return@runOnUiThread
-            tvHeight.text = "目标占比: %.2f".format(ratio)
+            tvHeight.text = "高度: %.2fm | 目标占比: %.2f".format(currentUltrasonicHeightM, ratio)
             tvErrorX.text = "ErrX: %.3f".format(errX)
             tvErrorY.text = "ErrY: %.3f".format(errY)
             tvCmd.text = "Cmd R/P/V: %.2f / %.2f / %.2f".format(cmdRoll, cmdPitch, cmdVert)
@@ -967,7 +1155,42 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateControlUi() {
+        runOnUiThread {
+            if (!isActivityAlive) return@runOnUiThread
+            when {
+                autoLandingActive -> {
+                    btnEnable.text = "自动降落接管中"
+                    btnEnable.isEnabled = false
+                }
+                isControlEnabled -> {
+                    btnEnable.text = "控制中..."
+                    btnEnable.isEnabled = false
+                }
+                else -> {
+                    btnEnable.text = "进入控制模式"
+                    btnEnable.isEnabled = true
+                }
+            }
+        }
+    }
+
+    private fun shouldKeepCurrentStateInPreview(): Boolean {
+        return autoLandingActive || trackingState == TrackingState.AUTO_LANDING || trackingState == TrackingState.EMERGENCY_STOP
+    }
+
+    private fun isReadyForAutoLanding(boxRatio: Double): Boolean {
+        val heightReady = currentUltrasonicHeightM > 0.05 && currentUltrasonicHeightM <= FINAL_HEIGHT_THRESHOLD_M
+        val ratioReady = boxRatio >= FINAL_BOX_RATIO_THRESHOLD
+        return ratioReady || heightReady
+    }
+
+    private fun isSameRect(a: Rect, b: Rect): Boolean {
+        return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
+    }
+
     private fun showStatus(detail: String) {
+        lastStatusDetail = detail
         runOnUiThread {
             if (!isActivityAlive) return@runOnUiThread
             tvStatus.text = buildStatusLine(detail)
@@ -984,7 +1207,11 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     override fun onDestroy() {
         isActivityAlive = false
 
-        stopTracking("页面关闭，释放控制", TrackingState.IDLE)
+        if (autoLandingActive) {
+            stopAutoLandingAndEnterPreview("页面关闭，停止自动降落监听")
+        } else {
+            stopTracking("页面关闭，释放控制", TrackingState.IDLE)
+        }
 
         try {
             MediaDataCenter.getInstance().cameraStreamManager.removeFrameListener(frameListener)
@@ -998,6 +1225,12 @@ class RealTimeTrackingActivity : AppCompatActivity() {
             VirtualStickManager.getInstance().removeVirtualStickStateListener(vsStateListener)
         } catch (e: Exception) {
             Log.w(TAG, "removeVirtualStickStateListener failed: ${e.message}")
+        }
+
+        try {
+            KeyManager.getInstance().cancelListen(this)
+        } catch (e: Exception) {
+            Log.w(TAG, "cancelListen failed: ${e.message}")
         }
 
         detectExecutor?.shutdownNow()

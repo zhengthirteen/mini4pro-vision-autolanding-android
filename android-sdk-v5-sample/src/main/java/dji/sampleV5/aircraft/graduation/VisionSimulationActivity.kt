@@ -11,6 +11,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -29,7 +30,6 @@ import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.abs
 import kotlin.math.max
-import kotlin.math.min
 
 class VisionSimulationActivity : AppCompatActivity() {
 
@@ -38,6 +38,7 @@ class VisionSimulationActivity : AppCompatActivity() {
         SEARCHING,
         ALIGNING,
         DESCENDING,
+        AUTO_LANDING,
         LOST
     }
 
@@ -47,10 +48,16 @@ class VisionSimulationActivity : AppCompatActivity() {
         ROI
     }
 
+    private enum class RunMode {
+        PREVIEW,
+        CONTROL
+    }
+
     private lateinit var imageView: ImageView
     private lateinit var statusText: TextView
     private lateinit var loadingBar: ProgressBar
     private lateinit var switchVideoBtn: Button
+    private lateinit var controlBtn: Button
 
     @Volatile
     private var isRunning = false
@@ -67,17 +74,20 @@ class VisionSimulationActivity : AppCompatActivity() {
 
     private lateinit var yoloDetector: YoloV8Detector
 
-    // 跟实机逻辑对齐的状态变量
+    private var runMode = RunMode.PREVIEW
     private var trackingState = TrackingState.IDLE
+    private var autoLandingActive = false
+
     private var lastTargetRect: Rect? = null
+    private var lastMainTarget: OverlayTarget? = null
     private var trackingLostCount = 0
     private var consecutiveFoundFrames = 0
     private var consecutiveAlignedFrames = 0
     private var consecutiveLostFrames = 0
+    private var consecutiveFinalFrames = 0
 
-    private var currentDisplayRect: Rect? = null
-    private var currentDisplayLabel: String? = null
-    private var currentDisplayConfidence: Float = 0f
+    private var currentDisplayTargets: List<OverlayTarget> = emptyList()
+    private var currentMainTarget: OverlayTarget? = null
     private var currentSearchMode = SearchMode.GLOBAL
     private var currentRoiRect: Rect? = null
 
@@ -87,8 +97,8 @@ class VisionSimulationActivity : AppCompatActivity() {
     private var lastCmdRoll = 0.0
     private var lastCmdPitch = 0.0
     private var lastCmdVert = 0.0
+    private var lastStatusDetail = "待机"
 
-    // FPS / 检测频率
     private var previewFrameCount = 0
     private var detectFrameCount = 0
     private var previewFps = 0.0
@@ -96,32 +106,25 @@ class VisionSimulationActivity : AppCompatActivity() {
     private var fpsWindowStartMs = 0L
     private var lastDetectRequestMs = 0L
 
-    private val controllableLabels = setOf(
-        "land_h",
-        "blue_circle_2",
-        "green_circle_3",
-        "red_circle_1"
-    )
-
     companion object {
         private const val TAG = "VisionSimulation"
 
-        // 默认先和你当前满意的实机检测分辨率保持一致
         private const val PROC_W = 640
         private const val PROC_H = 360
         private const val CROP_SIZE = 320
-
-        // 先和你当前实机手动改成的 300ms 对齐
         private const val DETECT_INTERVAL_MS = 300L
 
         private const val LOST_FRAME_THRESHOLD = 10
         private const val FOUND_FRAME_THRESHOLD = 3
         private const val ALIGN_FRAME_THRESHOLD = 5
+        private const val FINAL_FRAME_THRESHOLD = 4
 
         private const val ALIGN_THRESHOLD_X = 0.08
         private const val ALIGN_THRESHOLD_Y = 0.08
+        private const val FINAL_ALIGN_THRESHOLD_X = 0.05
+        private const val FINAL_ALIGN_THRESHOLD_Y = 0.05
+        private const val FINAL_BOX_RATIO_THRESHOLD = 0.35
 
-        // 仿真预览按 30fps 节奏播放
         private const val TARGET_FRAME_INTERVAL_MS = 33L
     }
 
@@ -170,6 +173,7 @@ class VisionSimulationActivity : AppCompatActivity() {
         runOnUiThread {
             loadingBar.visibility = View.VISIBLE
             switchVideoBtn.isEnabled = false
+            controlBtn.isEnabled = false
             switchVideoBtn.text = "加载中..."
         }
 
@@ -192,7 +196,9 @@ class VisionSimulationActivity : AppCompatActivity() {
             runOnUiThread {
                 loadingBar.visibility = View.GONE
                 switchVideoBtn.isEnabled = true
+                controlBtn.isEnabled = true
                 switchVideoBtn.text = "切换素材 (${currentVideoIndex + 1}/${videoResources.size})"
+                updateControlButtonUi()
             }
 
             isRunning = true
@@ -217,10 +223,8 @@ class VisionSimulationActivity : AppCompatActivity() {
                 if (frameSrc.empty()) continue
 
                 try {
-                    // 1) 统一处理分辨率
                     Imgproc.resize(frameSrc, frameProc, Size(PROC_W.toDouble(), PROC_H.toDouble()))
 
-                    // 2) 低频检测
                     val now = SystemClock.uptimeMillis()
                     if (now - lastDetectRequestMs >= DETECT_INTERVAL_MS) {
                         lastDetectRequestMs = now
@@ -228,10 +232,7 @@ class VisionSimulationActivity : AppCompatActivity() {
                         markDetectFrame()
                     }
 
-                    // 3) 画叠加层
                     drawVisionOverlay(frameProc)
-
-                    // 4) 刷新预览
                     Utils.matToBitmap(frameProc, displayBitmap)
                     markPreviewFrame()
 
@@ -239,7 +240,6 @@ class VisionSimulationActivity : AppCompatActivity() {
                         imageView.setImageBitmap(displayBitmap)
                         statusText.text = buildStatusText(videoName)
                     }
-
                 } catch (e: Exception) {
                     Log.e(TAG, "loop error: ${e.message}", e)
                 }
@@ -261,7 +261,6 @@ class VisionSimulationActivity : AppCompatActivity() {
         var roiForThisFrame: Rect? = null
         var searchModeForThisFrame = SearchMode.GLOBAL
 
-        // A. 动态 ROI 追踪
         if (lastTargetRect != null && trackingLostCount < LOST_FRAME_THRESHOLD) {
             val roiRect = buildCropRect(lastTargetRect!!, imgW, imgH)
             val roiMat = Mat(frame, roiRect)
@@ -280,7 +279,6 @@ class VisionSimulationActivity : AppCompatActivity() {
             }
         }
 
-        // B. 中心鹰眼
         if (results.isEmpty()) {
             val centerRect = Rect(
                 (imgW - CROP_SIZE) / 2,
@@ -302,7 +300,6 @@ class VisionSimulationActivity : AppCompatActivity() {
             }
         }
 
-        // C. 全图缩放搜索
         if (results.isEmpty()) {
             Imgproc.resize(frame, globalDetectMat, Size(CROP_SIZE.toDouble(), CROP_SIZE.toDouble()))
             results = yoloDetector.detect(globalDetectMat)
@@ -317,27 +314,68 @@ class VisionSimulationActivity : AppCompatActivity() {
         currentRoiRect = roiForThisFrame
         currentSearchMode = searchModeForThisFrame
 
-        val target = results.firstOrNull { it.label in controllableLabels }
+        val allTargets = results.map { result ->
+            val restored = restoreRectToProc(result.rect, roiForThisFrame, imgW, imgH)
+            OverlayTarget(
+                label = result.label,
+                confidence = result.confidence,
+                rect = restored
+            )
+        }
 
-        if (target != null) {
-            val displayRect = restoreRectToProc(target.rect, roiForThisFrame, imgW, imgH)
-            currentDisplayRect = Rect(displayRect.x, displayRect.y, displayRect.width, displayRect.height)
-            currentDisplayLabel = target.label
-            currentDisplayConfidence = target.confidence
-            lastTargetRect = Rect(displayRect.x, displayRect.y, displayRect.width, displayRect.height)
+        val selected = MainTargetSelector.selectMainTarget(allTargets, lastMainTarget, imgW, imgH)
+        currentMainTarget = selected?.deepCopy(isMainTarget = true)
+        currentDisplayTargets = allTargets.map { target ->
+            target.deepCopy(isMainTarget = selected != null && isSameRect(target.rect, selected.rect) && target.label == selected.label)
+        }
 
-            handleTargetFound(displayRect, imgW, imgH)
+        if (selected != null) {
+            lastMainTarget = selected.deepCopy()
+            lastTargetRect = Rect(selected.rect.x, selected.rect.y, selected.rect.width, selected.rect.height)
+
+            if (runMode == RunMode.CONTROL) {
+                handleTargetFound(selected, imgW, imgH)
+            } else {
+                holdPreviewObservation(selected, imgW, imgH)
+            }
         } else {
-            handleTargetLost()
+            if (runMode == RunMode.CONTROL) {
+                handleTargetLost()
+            } else {
+                holdPreviewNoTarget()
+            }
         }
     }
 
-    private fun handleTargetFound(rect: Rect, imgW: Int, imgH: Int) {
-        val centerX = rect.x + rect.width / 2.0
-        val centerY = rect.y + rect.height / 2.0
+    private fun holdPreviewObservation(target: OverlayTarget, imgW: Int, imgH: Int) {
+        lastBoxRatio = target.rect.width.toDouble() / imgW.toDouble()
+        lastErrX = (target.centerX - imgW / 2.0) / (imgW / 2.0)
+        lastErrY = (target.centerY - imgH / 2.0) / (imgH / 2.0)
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdVert = 0.0
+        if (!shouldKeepCurrentStateInPreview()) {
+            trackingState = TrackingState.IDLE
+            lastStatusDetail = "预览模式：仅检测显示"
+        }
+    }
 
-        val normErrorX = (centerX - imgW / 2.0) / (imgW / 2.0)
-        val normErrorY = (centerY - imgH / 2.0) / (imgH / 2.0)
+    private fun holdPreviewNoTarget() {
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdVert = 0.0
+        lastErrX = 0.0
+        lastErrY = 0.0
+        if (!shouldKeepCurrentStateInPreview()) {
+            trackingState = TrackingState.IDLE
+            lastStatusDetail = "预览模式：未发现目标"
+        }
+    }
+
+    private fun handleTargetFound(target: OverlayTarget, imgW: Int, imgH: Int) {
+        val rect = target.rect
+        val normErrorX = (target.centerX - imgW / 2.0) / (imgW / 2.0)
+        val normErrorY = (target.centerY - imgH / 2.0) / (imgH / 2.0)
         val boxRatio = rect.width.toDouble() / imgW.toDouble()
 
         lastBoxRatio = boxRatio
@@ -349,12 +387,15 @@ class VisionSimulationActivity : AppCompatActivity() {
 
         if (trackingState == TrackingState.LOST || trackingState == TrackingState.IDLE) {
             trackingState = TrackingState.SEARCHING
+            lastStatusDetail = "重新发现目标，等待稳定"
         }
 
         val alignedNow = abs(normErrorX) < ALIGN_THRESHOLD_X && abs(normErrorY) < ALIGN_THRESHOLD_Y
+        val finalAlignedNow = abs(normErrorX) < FINAL_ALIGN_THRESHOLD_X && abs(normErrorY) < FINAL_ALIGN_THRESHOLD_Y
 
         if (trackingState == TrackingState.SEARCHING && consecutiveFoundFrames >= FOUND_FRAME_THRESHOLD) {
             trackingState = TrackingState.ALIGNING
+            lastStatusDetail = "目标稳定，开始对准"
         }
 
         if (trackingState == TrackingState.ALIGNING) {
@@ -362,6 +403,8 @@ class VisionSimulationActivity : AppCompatActivity() {
                 consecutiveAlignedFrames++
                 if (consecutiveAlignedFrames >= ALIGN_FRAME_THRESHOLD) {
                     trackingState = TrackingState.DESCENDING
+                    consecutiveFinalFrames = 0
+                    lastStatusDetail = "对准稳定，开始下降"
                 }
             } else {
                 consecutiveAlignedFrames = 0
@@ -369,45 +412,126 @@ class VisionSimulationActivity : AppCompatActivity() {
         } else if (trackingState == TrackingState.DESCENDING) {
             if (!alignedNow) {
                 consecutiveAlignedFrames = 0
+                consecutiveFinalFrames = 0
                 trackingState = TrackingState.ALIGNING
+                lastStatusDetail = "偏差变大，回到对准"
+            } else if (finalAlignedNow && boxRatio >= FINAL_BOX_RATIO_THRESHOLD) {
+                consecutiveFinalFrames++
+                if (consecutiveFinalFrames >= FINAL_FRAME_THRESHOLD) {
+                    startAutoLandingTransfer("进入最终阶段，切自动降落")
+                    return
+                }
+            } else {
+                consecutiveFinalFrames = 0
             }
         }
 
         val vRoll = normErrorX * 0.5
         val vPitch = -normErrorY * 0.5
-        val vVert = when (trackingState) {
-            TrackingState.DESCENDING -> computeVerticalSpeed(boxRatio)
-            else -> 0.0
-        }
+        val vVert = if (trackingState == TrackingState.DESCENDING) computeVerticalSpeed(boxRatio) else 0.0
 
-        lastCmdRoll = vRoll
-        lastCmdPitch = vPitch
-        lastCmdVert = vVert
+        when (trackingState) {
+            TrackingState.SEARCHING -> {
+                lastCmdRoll = 0.0
+                lastCmdPitch = 0.0
+                lastCmdVert = 0.0
+                lastStatusDetail = "已发现目标，等待稳定"
+            }
+
+            TrackingState.ALIGNING -> {
+                lastCmdRoll = vRoll
+                lastCmdPitch = vPitch
+                lastCmdVert = 0.0
+                lastStatusDetail = "正在对准"
+            }
+
+            TrackingState.DESCENDING -> {
+                lastCmdRoll = vRoll
+                lastCmdPitch = vPitch
+                lastCmdVert = vVert
+                lastStatusDetail = "视觉下降中"
+            }
+
+            TrackingState.AUTO_LANDING,
+            TrackingState.IDLE,
+            TrackingState.LOST -> {
+                lastCmdRoll = 0.0
+                lastCmdPitch = 0.0
+                lastCmdVert = 0.0
+            }
+        }
     }
 
     private fun handleTargetLost() {
         consecutiveFoundFrames = 0
         consecutiveAlignedFrames = 0
+        consecutiveFinalFrames = 0
         consecutiveLostFrames++
 
         if (consecutiveLostFrames > LOST_FRAME_THRESHOLD) {
             trackingLostCount = LOST_FRAME_THRESHOLD
             lastTargetRect = null
-            currentDisplayRect = null
-            currentDisplayLabel = null
-            currentDisplayConfidence = 0f
+            lastMainTarget = null
+            currentMainTarget = null
+            currentDisplayTargets = emptyList()
             currentRoiRect = null
             currentSearchMode = SearchMode.GLOBAL
             trackingState = TrackingState.LOST
-        } else {
-            if (trackingState != TrackingState.IDLE) {
-                trackingState = TrackingState.SEARCHING
-            }
+            lastStatusDetail = "目标丢失"
+        } else if (trackingState != TrackingState.IDLE) {
+            trackingState = TrackingState.SEARCHING
+            lastStatusDetail = "短时丢失，继续搜索"
         }
 
         lastCmdRoll = 0.0
         lastCmdPitch = 0.0
         lastCmdVert = 0.0
+        lastErrX = 0.0
+        lastErrY = 0.0
+    }
+
+    private fun startAutoLandingTransfer(detail: String) {
+        autoLandingActive = true
+        runMode = RunMode.PREVIEW
+        trackingState = TrackingState.AUTO_LANDING
+        consecutiveFoundFrames = 0
+        consecutiveAlignedFrames = 0
+        consecutiveFinalFrames = 0
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdVert = 0.0
+        lastStatusDetail = detail
+        runOnUiThread { updateControlButtonUi() }
+    }
+
+    private fun enterControlMode() {
+        autoLandingActive = false
+        runMode = RunMode.CONTROL
+        trackingState = TrackingState.SEARCHING
+        consecutiveFoundFrames = 0
+        consecutiveAlignedFrames = 0
+        consecutiveLostFrames = 0
+        consecutiveFinalFrames = 0
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdVert = 0.0
+        lastStatusDetail = "控制模式已开启"
+        updateControlButtonUi()
+    }
+
+    private fun exitControlMode() {
+        runMode = RunMode.PREVIEW
+        autoLandingActive = false
+        trackingState = TrackingState.IDLE
+        consecutiveFoundFrames = 0
+        consecutiveAlignedFrames = 0
+        consecutiveLostFrames = 0
+        consecutiveFinalFrames = 0
+        lastCmdRoll = 0.0
+        lastCmdPitch = 0.0
+        lastCmdVert = 0.0
+        lastStatusDetail = "已退出控制模式"
+        updateControlButtonUi()
     }
 
     private fun drawVisionOverlay(frame: Mat) {
@@ -415,15 +539,9 @@ class VisionSimulationActivity : AppCompatActivity() {
             Imgproc.rectangle(frame, it, Scalar(255.0, 255.0, 0.0), 2)
         }
 
-        val modeText = when (currentSearchMode) {
-            SearchMode.ROI -> "ROI TRACKING"
-            SearchMode.EAGLE_EYE -> "EAGLE EYE"
-            SearchMode.GLOBAL -> "GLOBAL SEARCH"
-        }
-
         Imgproc.putText(
             frame,
-            modeText,
+            buildOverlayModeText(),
             Point(20.0, 35.0),
             Imgproc.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -431,16 +549,28 @@ class VisionSimulationActivity : AppCompatActivity() {
             2
         )
 
-        currentDisplayRect?.let { rect ->
-            Imgproc.rectangle(frame, rect, Scalar(0.0, 255.0, 0.0), 2)
-            val label = "${currentDisplayLabel ?: "target"} ${"%.2f".format(currentDisplayConfidence)}"
+        currentDisplayTargets.filter { !it.isMainTarget }.forEach { target ->
+            Imgproc.rectangle(frame, target.rect, Scalar(255.0, 255.0, 0.0), 2)
             Imgproc.putText(
                 frame,
-                label,
-                Point(rect.x.toDouble(), max(20, rect.y - 8).toDouble()),
+                "${target.label} ${"%.2f".format(target.confidence)}",
+                Point(target.rect.x.toDouble(), max(20, target.rect.y - 8).toDouble()),
                 Imgproc.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                Scalar(0.0, 255.0, 255.0),
+                Scalar(255.0, 255.0, 0.0),
+                2
+            )
+        }
+
+        currentDisplayTargets.firstOrNull { it.isMainTarget }?.let { target ->
+            Imgproc.rectangle(frame, target.rect, Scalar(0.0, 255.0, 0.0), 3)
+            Imgproc.putText(
+                frame,
+                "MAIN ${target.label} ${"%.2f".format(target.confidence)}",
+                Point(target.rect.x.toDouble(), max(20, target.rect.y - 8).toDouble()),
+                Imgproc.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                Scalar(0.0, 255.0, 0.0),
                 2
             )
         }
@@ -485,30 +615,34 @@ class VisionSimulationActivity : AppCompatActivity() {
         }
     }
 
+    private fun buildOverlayModeText(): String {
+        val searchText = when (currentSearchMode) {
+            SearchMode.ROI -> "ROI TRACKING"
+            SearchMode.EAGLE_EYE -> "EAGLE EYE"
+            SearchMode.GLOBAL -> "GLOBAL SEARCH"
+        }
+        val runText = when (runMode) {
+            RunMode.PREVIEW -> "PREVIEW"
+            RunMode.CONTROL -> "CONTROL"
+        }
+        return "$searchText | $runText"
+    }
+
     private fun stateLabel(state: TrackingState): String {
         return when (state) {
             TrackingState.IDLE -> "IDLE"
             TrackingState.SEARCHING -> "SEARCHING"
             TrackingState.ALIGNING -> "ALIGNING"
             TrackingState.DESCENDING -> "DESCENDING"
+            TrackingState.AUTO_LANDING -> "AUTO_LANDING"
             TrackingState.LOST -> "LOST"
         }
     }
 
-    private fun modeLabel(mode: SearchMode): String {
-        return when (mode) {
-            SearchMode.ROI -> "ROI"
-            SearchMode.EAGLE_EYE -> "EAGLE"
-            SearchMode.GLOBAL -> "GLOBAL"
-        }
-    }
-
     private fun buildStatusText(videoName: String): String {
-        val targetText = if (currentDisplayLabel != null) {
-            "${currentDisplayLabel} ${"%.2f".format(currentDisplayConfidence)}"
-        } else {
-            "None"
-        }
+        val mainTargetText = currentMainTarget?.let {
+            "${it.label} ${"%.2f".format(it.confidence)}"
+        } ?: "None"
 
         return buildString {
             append("Video: ")
@@ -520,13 +654,18 @@ class VisionSimulationActivity : AppCompatActivity() {
             append(String.format("%.1f", detectFps))
             append("Hz")
             append("\n")
-            append("State: ")
+            append("RunMode: ")
+            append(runMode.name)
+            append(" | State: ")
             append(stateLabel(trackingState))
-            append(" | Mode: ")
-            append(modeLabel(currentSearchMode))
             append("\n")
-            append("Target: ")
-            append(targetText)
+            append("Mode: ")
+            append(currentSearchMode.name)
+            append(" | Boxes: ")
+            append(currentDisplayTargets.size)
+            append("\n")
+            append("Main: ")
+            append(mainTargetText)
             append(" | Ratio: ")
             append(String.format("%.2f", lastBoxRatio))
             append("\n")
@@ -537,6 +676,9 @@ class VisionSimulationActivity : AppCompatActivity() {
             append("\n")
             append("Cmd R/P/V: ")
             append(String.format("%.2f / %.2f / %.2f", lastCmdRoll, lastCmdPitch, lastCmdVert))
+            append("\n")
+            append("Detail: ")
+            append(lastStatusDetail)
         }
     }
 
@@ -563,16 +705,20 @@ class VisionSimulationActivity : AppCompatActivity() {
     }
 
     private fun resetTrackingState() {
+        runMode = RunMode.PREVIEW
         trackingState = TrackingState.IDLE
+        autoLandingActive = false
+
         lastTargetRect = null
+        lastMainTarget = null
         trackingLostCount = 0
         consecutiveFoundFrames = 0
         consecutiveAlignedFrames = 0
         consecutiveLostFrames = 0
+        consecutiveFinalFrames = 0
 
-        currentDisplayRect = null
-        currentDisplayLabel = null
-        currentDisplayConfidence = 0f
+        currentDisplayTargets = emptyList()
+        currentMainTarget = null
         currentSearchMode = SearchMode.GLOBAL
         currentRoiRect = null
 
@@ -582,6 +728,7 @@ class VisionSimulationActivity : AppCompatActivity() {
         lastCmdRoll = 0.0
         lastCmdPitch = 0.0
         lastCmdVert = 0.0
+        lastStatusDetail = "待机"
 
         lastDetectRequestMs = 0L
         previewFrameCount = 0
@@ -589,6 +736,8 @@ class VisionSimulationActivity : AppCompatActivity() {
         previewFps = 0.0
         detectFps = 0.0
         fpsWindowStartMs = SystemClock.uptimeMillis()
+
+        runOnUiThread { updateControlButtonUi() }
     }
 
     private fun onSwitchVideoClicked() {
@@ -629,7 +778,9 @@ class VisionSimulationActivity : AppCompatActivity() {
         loadingBar.visibility = View.GONE
         rootLayout.addView(loadingBar, paramsBar)
 
-        val controlPanel = FrameLayout(this)
+        val controlPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
         val panelParams = FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
@@ -643,9 +794,48 @@ class VisionSimulationActivity : AppCompatActivity() {
         }
         controlPanel.addView(switchVideoBtn)
 
+        controlBtn = Button(this).apply {
+            text = "进入控制模式"
+            setOnClickListener {
+                if (runMode == RunMode.PREVIEW) enterControlMode() else exitControlMode()
+            }
+        }
+        val controlBtnParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        controlBtnParams.topMargin = 20
+        controlPanel.addView(controlBtn, controlBtnParams)
+
         rootLayout.addView(controlPanel, panelParams)
 
         setContentView(rootLayout)
+    }
+
+    private fun updateControlButtonUi() {
+        if (!::controlBtn.isInitialized) return
+        when {
+            autoLandingActive -> {
+                controlBtn.text = "自动降落接管中"
+                controlBtn.isEnabled = false
+            }
+            runMode == RunMode.CONTROL -> {
+                controlBtn.text = "退出控制模式"
+                controlBtn.isEnabled = true
+            }
+            else -> {
+                controlBtn.text = "进入控制模式"
+                controlBtn.isEnabled = true
+            }
+        }
+    }
+
+    private fun shouldKeepCurrentStateInPreview(): Boolean {
+        return autoLandingActive || trackingState == TrackingState.AUTO_LANDING
+    }
+
+    private fun isSameRect(a: Rect, b: Rect): Boolean {
+        return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height
     }
 
     private fun copyRawResourceToCache(resName: String): String? {

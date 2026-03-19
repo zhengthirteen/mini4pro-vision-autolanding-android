@@ -41,7 +41,7 @@
             android:id="@+id/tv_height"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="目标占比: 0.00"
+            android:text="高度: 0.00m | 目标占比: 0.00"
             android:textColor="#00FF00"
             android:textSize="18sp"
             android:textStyle="bold" />
@@ -82,7 +82,7 @@
             android:id="@+id/tv_status"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="状态: IDLE | 待机"
+            android:text="状态: IDLE | 模式: PREVIEW | 待机"
             android:textColor="#FFFFFF"
             android:textSize="14sp" />
     </LinearLayout>
@@ -120,7 +120,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="10dp"
             android:backgroundTint="#2196F3"
-            android:text="开启追踪"
+            android:text="进入控制模式"
             android:textSize="12sp" />
 
         <Button

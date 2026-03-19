@@ -18,16 +18,20 @@ class DetectionOverlayView @JvmOverloads constructor(
     private var procWidth: Int = 0
     private var procHeight: Int = 0
 
-    private var targetRect: Rect? = null
+    private var targets: List<OverlayTarget> = emptyList()
     private var roiRect: Rect? = null
-    private var label: String? = null
-    private var confidence: Float = 0f
     private var modeText: String = "GLOBAL SEARCH"
 
     private val targetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.CYAN
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+    }
+
+    private val mainTargetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.GREEN
         style = Paint.Style.STROKE
-        strokeWidth = 4f
+        strokeWidth = 5f
     }
 
     private val roiPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -38,6 +42,13 @@ class DetectionOverlayView @JvmOverloads constructor(
 
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.CYAN
+        style = Paint.Style.FILL
+        textSize = 30f
+        setShadowLayer(6f, 0f, 0f, Color.BLACK)
+    }
+
+    private val mainTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.GREEN
         style = Paint.Style.FILL
         textSize = 34f
         setShadowLayer(6f, 0f, 0f, Color.BLACK)
@@ -53,27 +64,21 @@ class DetectionOverlayView @JvmOverloads constructor(
     fun updateOverlay(
         procWidth: Int,
         procHeight: Int,
-        targetRect: Rect?,
+        targets: List<OverlayTarget>,
         roiRect: Rect?,
-        label: String?,
-        confidence: Float,
         modeText: String
     ) {
         this.procWidth = procWidth
         this.procHeight = procHeight
-        this.targetRect = targetRect?.let { Rect(it.x, it.y, it.width, it.height) }
+        this.targets = targets.map { it.deepCopy() }
         this.roiRect = roiRect?.let { Rect(it.x, it.y, it.width, it.height) }
-        this.label = label
-        this.confidence = confidence
         this.modeText = modeText
         postInvalidateOnAnimation()
     }
 
     fun clearOverlay() {
-        targetRect = null
+        targets = emptyList()
         roiRect = null
-        label = null
-        confidence = 0f
         modeText = "GLOBAL SEARCH"
         postInvalidateOnAnimation()
     }
@@ -98,16 +103,16 @@ class DetectionOverlayView @JvmOverloads constructor(
             canvas.drawRect(mapRect(it, contentRect), roiPaint)
         }
 
-        targetRect?.let {
-            val mapped = mapRect(it, contentRect)
-            canvas.drawRect(mapped, targetPaint)
+        val orderedTargets = targets.sortedBy { if (it.isMainTarget) 1 else 0 }
+        orderedTargets.forEach { target ->
+            val mapped = mapRect(target.rect, contentRect)
+            val paint = if (target.isMainTarget) mainTargetPaint else targetPaint
+            val textPaint = if (target.isMainTarget) mainTextPaint else this.textPaint
 
-            val text = buildString {
-                append(label ?: "target")
-                append(" ")
-                append(String.format("%.2f", confidence))
-            }
+            canvas.drawRect(mapped, paint)
 
+            val prefix = if (target.isMainTarget) "MAIN " else ""
+            val text = "$prefix${target.label} ${"%.2f".format(target.confidence)}"
             val textX = mapped.left
             val textY = (mapped.top - 12f).coerceAtLeast(contentRect.top + 32f)
             canvas.drawText(text, textX, textY, textPaint)
