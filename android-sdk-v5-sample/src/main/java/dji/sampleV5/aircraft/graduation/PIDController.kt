@@ -4,60 +4,64 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * 改进后的 PD 控制器
- * 增加了微分(D)项，用于抑制震荡
+ * 专为低频视觉设计的 PD 控制器 (综合优化版)
+ * 1. 降低 Kp，增加 Kd 提供刹车阻尼
+ * 2. 缩小死区修复状态机冲突 Bug
+ * 3. 引入一阶低通滤波消除视觉检测框抖动带来的微分噪声
  */
 class PIDController(
-    private val maxSpeed: Double // 最大限速 (建议设为 0.5 或者更保守的 0.3)
+    private val maxSpeed: Double // 建议传入 0.15
 ) {
-    // 参数调整建议：
-    // Kp (拉力): 越大反应越快，但也容易震荡。建议 0.1 ~ 0.15
-    // Kd (刹车): 用于抑制震荡。建议 0.05 ~ 0.1
-    private val Kp = 0.12
-    private val Kd = 0.08
+    // 调小 P，让动作更柔和；保留适量 D，增强对抗速度变化的阻力
+    private val Kp = 0.07
+    private val Kd = 0.10
 
     private var lastError: Double = 0.0
     private var lastTime: Long = 0
+    private var lastOutput: Double = 0.0
 
-    // 重置状态 (每次开启追踪时建议调用，防止微分飞车)
     fun reset() {
         lastError = 0.0
         lastTime = 0
+        lastOutput = 0.0
     }
 
     fun calculate(error: Double): Double {
         val currentTime = System.currentTimeMillis()
 
         // 1. 死区控制 (Deadband)
-        // 误差小于 10cm 时忽略，防止在中心反复微调
-        if (kotlin.math.abs(error) < 0.10) {
+        // 【核心修复】：死区降为 0.04，必须小于状态机的 ALIGN_THRESHOLD (0.10)
+        // 否则 PID 输出 0 但状态机仍未对准，会导致无人机靠惯性无控制漂移！
+        if (kotlin.math.abs(error) < 0.05) {
             reset()
             return 0.0
         }
+
         // 2. 计算 P 项 (比例)
         val pOut = Kp * error
 
         // 3. 计算 D 项 (微分/阻尼)
         var dOut = 0.0
         if (lastTime > 0) {
-            val deltaTime = (currentTime - lastTime) / 1000.0 // 转换为秒
+            val deltaTime = (currentTime - lastTime) / 1000.0
             if (deltaTime > 0) {
-                // 微分公式: (当前误差 - 上次误差) / 时间间隔
-                // 当误差快速减小时，(error - lastError) 为负，D项会产生反向力
                 val derivative = (error - lastError) / deltaTime
                 dOut = Kd * derivative
             }
         }
 
-        // 更新状态
         lastError = error
         lastTime = currentTime
 
-        // 4. 合成输出
-        val totalOut = pOut + dOut
+        val rawOut = pOut + dOut
+
+        // 4. 一阶低通滤波 (Low-pass Filter)
+        // 消除 YOLO 边界框在两帧之间微微跳动引发的突兀输出
+        val alpha = 0.6
+        val smoothOut = alpha * rawOut + (1 - alpha) * lastOutput
+        lastOutput = smoothOut
 
         // 5. 限幅 (Clamping)
-        // 确保输出速度不超过设定的 maxSpeed
-        return max(-maxSpeed, min(maxSpeed, totalOut))
+        return max(-maxSpeed, min(maxSpeed, smoothOut))
     }
 }

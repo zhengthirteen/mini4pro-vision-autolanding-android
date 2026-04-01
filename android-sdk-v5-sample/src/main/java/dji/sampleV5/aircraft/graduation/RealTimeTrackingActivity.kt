@@ -92,8 +92,11 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     @Volatile
     private var isActivityAlive = true
 
-    private val pidX = PIDController(maxSpeed = 0.5)
-    private val pidY = PIDController(maxSpeed = 0.5)
+    private val pidX = PIDController(maxSpeed = 0.3)
+    private val pidY = PIDController(maxSpeed = 0.3)
+    // 【新增】：用于 20Hz 自动刹车衰减的高频控制线程
+    private var stickTimer: java.util.Timer? = null
+    private var lastVelocityUpdateTimeMs = 0L
 
     private lateinit var yoloDetector: YoloV8Detector
 
@@ -157,19 +160,21 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         private const val PROC_W = 960
         private const val PROC_H = 540
         private const val CROP_SIZE = 480
-        private const val DETECT_INTERVAL_MS = 300L
+        private const val DETECT_INTERVAL_MS = 150L
 
         private const val LOST_FRAME_THRESHOLD = 10
         private const val FOUND_FRAME_THRESHOLD = 3
         private const val ALIGN_FRAME_THRESHOLD = 5
-        private const val FINAL_FRAME_THRESHOLD = 4
+        // 连续 2 帧确认达到 2 米即可移交
+        private const val FINAL_FRAME_THRESHOLD = 2
 
-        private const val ALIGN_THRESHOLD_X = 0.08
-        private const val ALIGN_THRESHOLD_Y = 0.08
+        private const val ALIGN_THRESHOLD_X = 0.10
+        private const val ALIGN_THRESHOLD_Y = 0.10
         private const val FINAL_ALIGN_THRESHOLD_X = 0.05
         private const val FINAL_ALIGN_THRESHOLD_Y = 0.05
         private const val FINAL_BOX_RATIO_THRESHOLD = 0.35
-        private const val FINAL_HEIGHT_THRESHOLD_M = 1.20
+        // 【修改】：将触发自动降落的高度门槛提高到 2.0 米
+        private const val FINAL_HEIGHT_THRESHOLD_M = 2.00
 
         private const val DASHBOARD_PUSH_INTERVAL_MS = 120L
     }
@@ -506,6 +511,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
                 runMode = RunMode.CONTROL
                 pidX.reset()
                 pidY.reset()
+                startStickTimer() // 【新增】启动高频平滑衰减线程
                 setTrackingState(TrackingState.SEARCHING, "已获取控制权，开始搜索目标")
                 updateControlUi()
             }
@@ -521,6 +527,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     }
 
     private fun stopTracking(reason: String, nextState: TrackingState = TrackingState.EMERGENCY_STOP) {
+        stopStickTimer() // 【新增】
         sendVelocityCommand(0.0, 0.0, 0.0, 0.0)
 
         isControlEnabled = false
@@ -561,6 +568,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     }
 
     private fun startAutoLandingTransfer(detail: String) {
+        stopStickTimer() // 【新增】
         sendVelocityCommand(0.0, 0.0, 0.0, 0.0)
 
         if (isControlEnabled) {
@@ -585,10 +593,16 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         updateControlUi()
 
         try {
-            KeyManager.getInstance().performAction(
-                KeyTools.createKey(FlightControllerKey.KeyStartAutoLanding),
-                null
-            )
+            if (isAircraftFlying) {
+                KeyManager.getInstance().performAction(
+                    KeyTools.createKey(FlightControllerKey.KeyStartAutoLanding),
+                    null
+                )
+            } else {
+                // 桌面测试时不真实下发，避免 MSDK 报错，完美模拟闭环
+                showToast("桌面测试：模拟触发自动降落，状态已流转")
+                Log.i(TAG, "桌面测试模拟降落，屏蔽物理 MSDK 调用")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "startAutoLandingTransfer error: ${e.message}", e)
             autoLandingActive = false
@@ -599,12 +613,16 @@ class RealTimeTrackingActivity : AppCompatActivity() {
 
     private fun confirmLandingIfNeeded() {
         try {
-            KeyManager.getInstance().performAction(
-                KeyTools.createKey(FlightControllerKey.KeyConfirmLanding),
-                null
-            )
+            if (isAircraftFlying) {
+                KeyManager.getInstance().performAction(
+                    KeyTools.createKey(FlightControllerKey.KeyConfirmLanding),
+                    null
+                )
+                showStatus("低空确认已发送，继续自动降落")
+            } else {
+                showToast("桌面测试：模拟发送低空降落确认")
+            }
             landingConfirmationNeeded = false
-            showStatus("低空确认已发送，继续自动降落")
         } catch (e: Exception) {
             Log.w(TAG, "confirmLandingIfNeeded failed: ${e.message}")
         }
@@ -889,7 +907,8 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         }
 
         val alignedNow = abs(normErrorX) < ALIGN_THRESHOLD_X && abs(normErrorY) < ALIGN_THRESHOLD_Y
-        val finalAlignedNow = abs(normErrorX) < FINAL_ALIGN_THRESHOLD_X && abs(normErrorY) < FINAL_ALIGN_THRESHOLD_Y
+        // 【新增】：放宽的下降期对准容忍度。只要误差不超过 0.20，就边降落边修正！
+        val relaxedAligned = abs(normErrorX) < 0.20 && abs(normErrorY) < 0.20
 
         if (trackingState == TrackingState.SEARCHING && consecutiveFoundFrames >= FOUND_FRAME_THRESHOLD) {
             setTrackingState(TrackingState.ALIGNING, "目标稳定，开始对准")
@@ -906,23 +925,27 @@ class RealTimeTrackingActivity : AppCompatActivity() {
                 consecutiveAlignedFrames = 0
             }
         } else if (trackingState == TrackingState.DESCENDING) {
-            if (!alignedNow) {
-                consecutiveAlignedFrames = 0
-                consecutiveFinalFrames = 0
-                setTrackingState(TrackingState.ALIGNING, "偏差变大，回到对准")
-            } else if (finalAlignedNow && isReadyForAutoLanding(boxRatio)) {
+            // 【修改 3】：优先级反转与双阈值融合
+            if (isReadyForAutoLanding(boxRatio)) {
+                // 第一优先级：只要高度小于2米，直接准备交接，无视对准度
                 consecutiveFinalFrames++
                 if (consecutiveFinalFrames >= FINAL_FRAME_THRESHOLD) {
-                    startAutoLandingTransfer("进入最终阶段，移交自动降落")
+                    startAutoLandingTransfer("高度达到 < 2m，停止视觉，果断移交盲降")
                     return
                 }
+            } else if (!relaxedAligned) {
+                // 第二优先级：如果还没降到 2 米，且偏离了较大范围(>0.20)，才回去重新对准
+                consecutiveAlignedFrames = 0
+                consecutiveFinalFrames = 0
+                setTrackingState(TrackingState.ALIGNING, "偏差较大，暂停下降去对准")
             } else {
                 consecutiveFinalFrames = 0
             }
         }
 
-        val vRoll = pidX.calculate(normErrorX * 2.0)
-        val vPitch = pidY.calculate(-normErrorY * 2.0)
+
+        val vRoll = pidX.calculate(normErrorX)
+        val vPitch = pidY.calculate(-normErrorY)
         val vVert = if (trackingState == TrackingState.DESCENDING) computeVerticalSpeed(boxRatio) else 0.0
 
         when (trackingState) {
@@ -1019,30 +1042,62 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         }
     }
 
+
+    // 【综合修改】：重写速度下发机制与平滑衰减
     private fun sendVelocityCommand(
         rollSpeed: Double,
         pitchSpeed: Double,
         yawSpeed: Double,
         verticalSpeed: Double
     ) {
+        // 只更新期望速度和时间戳，不直接调底层 SDK，交由高频 Timer 平滑下发
         lastCmdRoll = rollSpeed
         lastCmdPitch = pitchSpeed
         lastCmdYaw = yawSpeed
         lastCmdVert = verticalSpeed
+        lastVelocityUpdateTimeMs = SystemClock.uptimeMillis()
+    }
 
+    private fun startStickTimer() {
+        stopStickTimer()
+        stickTimer = java.util.Timer()
+        stickTimer?.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                applyStickDecayAndSend()
+            }
+        }, 0, 50) // 20Hz 高频发送
+    }
+
+    private fun stopStickTimer() {
+        stickTimer?.cancel()
+        stickTimer = null
+    }
+
+    private fun applyStickDecayAndSend() {
         if (!isControlEnabled) return
+        val now = SystemClock.uptimeMillis()
+        val dt = now - lastVelocityUpdateTimeMs
+
+        // 如果超过 500ms 没收到视觉更新（可能卡顿或目标丢失），强制切断横向动力
+        if (dt > 500) {
+            lastCmdRoll = 0.0
+            lastCmdPitch = 0.0
+            lastCmdYaw = 0.0
+            lastCmdVert = 0.0
+        } else if (dt > 250) {
+            // 只有当视觉帧严重迟到时，才触发衰减刹车！正常 150ms 帧间隔内原样下发，丝滑无比。
+            val decayFactor = 0.85
+            lastCmdRoll *= decayFactor
+            lastCmdPitch *= decayFactor
+            lastCmdYaw *= decayFactor
+            lastCmdVert *= decayFactor
+        }
 
         val speedToStickGain = 660.0
-        val rollStickVal = (rollSpeed * speedToStickGain).toInt()
-        val pitchStickVal = (pitchSpeed * speedToStickGain).toInt()
-        val yawStickVal = (yawSpeed * speedToStickGain).toInt()
-        val verticalStickVal = (verticalSpeed * speedToStickGain).toInt()
-
-        val maxStick = Stick.MAX_STICK_POSITION_ABS
-        val r = clamp(rollStickVal, -maxStick, maxStick)
-        val p = clamp(pitchStickVal, -maxStick, maxStick)
-        val y = clamp(yawStickVal, -maxStick, maxStick)
-        val v = clamp(verticalStickVal, -maxStick, maxStick)
+        val r = clamp((lastCmdRoll * speedToStickGain).toInt(), -660, 660)
+        val p = clamp((lastCmdPitch * speedToStickGain).toInt(), -660, 660)
+        val y = clamp((lastCmdYaw * speedToStickGain).toInt(), -660, 660)
+        val v = clamp((lastCmdVert * speedToStickGain).toInt(), -660, 660)
 
         try {
             val vsManager = VirtualStickManager.getInstance()
@@ -1055,7 +1110,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
                 verticalPosition = v
             }
         } catch (e: Exception) {
-            Log.e(TAG, "sendVelocityCommand error: ${e.message}", e)
+            Log.e(TAG, "applyStickDecayAndSend error: ${e.message}", e)
         }
     }
 
@@ -1180,9 +1235,14 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     }
 
     private fun isReadyForAutoLanding(boxRatio: Double): Boolean {
-        val heightReady = currentUltrasonicHeightM > 0.05 && currentUltrasonicHeightM <= FINAL_HEIGHT_THRESHOLD_M
-        val ratioReady = boxRatio >= FINAL_BOX_RATIO_THRESHOLD
-        return ratioReady || heightReady
+        return if (isAircraftFlying) {
+            // 【修改 5】：实飞状态下，只要超声波高度在 0.05m ~ 2.00m 之间，直接交接给大疆原生盲降。
+            // 彻底解决 2米 内目标尺度突变导致丢失和乱飘的问题！
+            currentUltrasonicHeightM > 0.05 && currentUltrasonicHeightM <= FINAL_HEIGHT_THRESHOLD_M
+        } else {
+            // 桌面静态测试状态：由于没起飞高度为0，依然允许通过占比来模拟触发闭环
+            boxRatio >= FINAL_BOX_RATIO_THRESHOLD
+        }
     }
 
     private fun isSameRect(a: Rect, b: Rect): Boolean {
@@ -1205,6 +1265,7 @@ class RealTimeTrackingActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        stopStickTimer() // 【新增】
         isActivityAlive = false
 
         if (autoLandingActive) {
