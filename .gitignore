@@ -34,3 +34,7 @@ captures/
 # local simulation videos (too large for normal GitHub repo)
 android-sdk-v5-sample/src/main/res/raw/sim_*.MP4
 android-sdk-v5-sample/src/main/res/raw/sim_*.mp4
+
+# generated analysis plots
+scripts/data_analysis/plots/
+plots

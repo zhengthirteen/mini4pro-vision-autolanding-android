@@ -276,6 +276,9 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         } else {
             showStatus("OpenCV 加载失败")
         }
+
+    // 【新增 1】：初始化 CSV 数据记录器 (传入 this 获取 Context 保证路径降级可用)
+        FlightDataLogger.init(this)
     }
 
     private fun initView() {
@@ -1093,6 +1096,20 @@ class RealTimeTrackingActivity : AppCompatActivity() {
             lastCmdVert *= decayFactor
         }
 
+        // 【新增 2】：记录此时此刻的所有闭环数据 (增加 runMode.name)
+        FlightDataLogger.log(
+            runMode = runMode.name,
+            state = trackingState.name,
+            searchMode = currentSearchMode.name,
+            height = currentUltrasonicHeightM,
+            errX = lastErrX,
+            errY = lastErrY,
+            boxRatio = lastBoxRatio,
+            cmdRoll = lastCmdRoll,
+            cmdPitch = lastCmdPitch,
+            cmdVert = lastCmdVert
+        )
+
         val speedToStickGain = 660.0
         val r = clamp((lastCmdRoll * speedToStickGain).toInt(), -660, 660)
         val p = clamp((lastCmdPitch * speedToStickGain).toInt(), -660, 660)
@@ -1301,6 +1318,9 @@ class RealTimeTrackingActivity : AppCompatActivity() {
         rgbMat?.release()
         frameProc?.release()
         globalDetectMat?.release()
+
+        // 【新增 3】：安全关闭并保存 CSV 文件
+        FlightDataLogger.close()
 
         super.onDestroy()
     }
